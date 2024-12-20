@@ -13,6 +13,15 @@ import warnings
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
+# Constants
+ELO_DIVISOR = 400
+DRAW_PROBABILITY = 0.25
+CONCACAF_BONUS = 100
+DEFAULT_TEAM_STRENGTH = 1000
+BASE_GOALS = 1.5
+MAX_OVERALL_MULTIPLIER = 1.5
+MIN_OVERALL_MULTIPLIER = 0.5
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
@@ -67,7 +76,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 @lru_cache(maxsize=128)
 def win_expectancy(difference: float) -> float:
     """Calculate win probability using ELO rating system."""
-    return 1 / (10 ** (-difference/400) + 1)
+    return 1 / (10 ** (-difference/ELO_DIVISOR) + 1)
 
 def sim(team_a: Tuple, team_b: Tuple, no_draw: bool = False) -> List:
     """
@@ -89,32 +98,29 @@ def sim(team_a: Tuple, team_b: Tuple, no_draw: bool = False) -> List:
     # Calculate win probabilities
     difference = strength_a - strength_b
     win_prob_a = win_expectancy(abs(difference)) if strength_a >= strength_b else 1 - win_expectancy(abs(difference))
-    
     # Determine winner
     random_val = random.random()
     if no_draw:
         winner = team_a if random_val < win_prob_a else team_b
     else:
-        draw_prob = 0.25  # Configurable draw probability
-        if random_val < win_prob_a * (1 - draw_prob):
+        if random_val < win_prob_a * (1 - DRAW_PROBABILITY):
             winner = team_a
-        elif random_val > 1 - ((1 - win_prob_a) * (1 - draw_prob)):
+        elif random_val > 1 - ((1 - win_prob_a) * (1 - DRAW_PROBABILITY)):
             winner = team_b
         else:
             winner = [team_a, team_b]
 
     # Generate realistic scores based on team strengths
-    base_goals = 1.5
     # Ensure strength_factor is between 0 and 1
     strength_factor = max(0, min(1, abs(strength_a - strength_b) / max(strength_a, strength_b)))
     
     if isinstance(winner, list):  # Draw
-        score = max(0, np.random.poisson(base_goals))
+        score = max(0, np.random.poisson(BASE_GOALS))
         return [winner, (score, score)]
     else:
         # Ensure non-negative lambda parameters
-        winner_lambda = max(0.1, base_goals * (1 + strength_factor))
-        loser_lambda = max(0.1, base_goals * (1 - strength_factor))
+        winner_lambda = max(0.1, BASE_GOALS * (1 + strength_factor))
+        loser_lambda = max(0.1, BASE_GOALS * (1 - strength_factor))
         
         winner_goals = np.random.poisson(winner_lambda)
         loser_goals = np.random.poisson(loser_lambda)
@@ -153,53 +159,60 @@ def fetch_team_data(confederation: str, url: str) -> List[List]:
         logging.error(f"Error fetching {confederation} data: {e}")
         return []
 
-def replace_many_one(string: str, lst: list, to_replace: str):
-    for x in lst:
-        string = string.replace(x, to_replace)
-    return string
+def replace_many_one(text: str, chars_to_replace: list, replacement: str) -> str:
+    """Replace multiple characters in a string with a single replacement."""
+    for char in chars_to_replace:
+        text = text.replace(char, replacement)
+    return text
 
 
-def return_removed(lst: list, items: list):
-    for item in items:
-        lst.remove(item)
-    return lst
+def return_removed(original_list: list, items_to_remove: list) -> list:
+    """Remove multiple items from a list."""
+    for item in items_to_remove:
+        original_list.remove(item)
+    return original_list
 
 
-def get_teams(confederation: str, confederation_page: str, n: int, conf_dict: dict) -> dict:
-    r = requests.get(confederation_page)
-    soup = BeautifulSoup(r.content, "html.parser")
-    ranking = []
-    for table in soup.find_all("table", {"class": "wikitable"}):
-        if len(table.find_all("caption")) > 0 and "FIFA Men's Rankings" in table.find_all("caption")[0].text:
-            for tr in table.find("tbody").find_all("tr")[1:]:
-                data = [replace_many_one(x.text, ["\n", "\xa0"], "").strip()
-                        for x in tr.find_all("td")[-2:]]
-                try:
-                    data[-1] = float(data[-1])
-                except ValueError:
-                    pass
-                else:
-                    data[-1] = data[-1] + 100 if data[-2] in ["United States",
-                                                              "Mexico", "Canada"] else data[-1]
-                    ranking.append(data)
-    # gives chances to underdogs against bigger opponents
-    if confederation == "CONCACAF":
-        conf_dict[confederation] = [x for x in ranking if x[0]
-                                    in ["United States", "Canada", "Mexico"]]
-        ranking = sorted([x for x in ranking if x[0] not in [
-            "United States", "Canada", "Mexico"]], key=lambda x: x[1], reverse=True)
-        ranking = random.sample(ranking[:n-1], n-3)
-        conf_dict[confederation] = sorted(
-            conf_dict[confederation]+ranking, key=lambda x: x[1], reverse=True)
-    elif confederation == "OFC":
-        conf_dict[confederation] = sorted(
-            ranking[:n], key=lambda x: x[1], reverse=True)
-    else:
-        randomizer = random.sample(ranking[2:n+2], n-2)
-        conf_dict[confederation] = sorted(
-            ranking[:2]+randomizer, key=lambda x: x[1], reverse=True)
+def get_teams(confederation: str, confederation_page: str, num_teams: int, conf_dict: dict) -> dict:
+    """Fetch and process team data for a confederation."""
+    try:
+        response = requests.get(confederation_page, timeout=10)
+        soup = BeautifulSoup(response.content, "html.parser")
+        ranking = []
+        for table in soup.find_all("table", {"class": "wikitable"}):
+            if len(table.find_all("caption")) > 0 and "FIFA Men's Rankings" in table.find_all("caption")[0].text:
+                for tr in table.find("tbody").find_all("tr")[1:]:
+                    data = [replace_many_one(x.text, ["\n", "\xa0"], "").strip()
+                            for x in tr.find_all("td")[-2:]]
+                    try:
+                        data[-1] = float(data[-1])
+                    except ValueError:
+                        continue
+                    else:
+                        data[-1] = data[-1] + CONCACAF_BONUS if data[-2] in ["United States",
+                                                                  "Mexico", "Canada"] else data[-1]
+                        ranking.append(data)
+        # gives chances to underdogs against bigger opponents
+        if confederation == "CONCACAF":
+            conf_dict[confederation] = [x for x in ranking if x[0]
+                                        in ["United States", "Canada", "Mexico"]]
+            ranking = sorted([x for x in ranking if x[0] not in [
+                "United States", "Canada", "Mexico"]], key=lambda x: x[1], reverse=True)
+            ranking = random.sample(ranking[:num_teams-1], num_teams-3)
+            conf_dict[confederation] = sorted(
+                conf_dict[confederation]+ranking, key=lambda x: x[1], reverse=True)
+        elif confederation == "OFC":
+            conf_dict[confederation] = sorted(
+                ranking[:num_teams], key=lambda x: x[1], reverse=True)
+        else:
+            randomizer = random.sample(ranking[2:num_teams+2], num_teams-2)
+            conf_dict[confederation] = sorted(
+                ranking[:2]+randomizer, key=lambda x: x[1], reverse=True)
 
-    return conf_dict
+        return conf_dict
+    except Exception as e:
+        logging.error(f"Error fetching {confederation}  {e}")
+        return conf_dict
 
 
 def final_qual_round(conf_dict: dict, n: int) -> dict:
