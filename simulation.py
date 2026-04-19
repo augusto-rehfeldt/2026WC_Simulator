@@ -466,18 +466,24 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
         logging.info("All player ratings loaded from cache")
     else:
         logging.info(f"Fetching player ratings for {len(missing_player)} countries...")
-        for country in missing_player:
-            rating = None
+
+        def fetch_with_retry(country: str) -> Tuple[str, Optional[float]]:
             for attempt in range(3):
                 rating = fetch_player_ratings_from_fifaratings(country, session)
                 if rating is not None:
-                    break
-                logging.warning(f"Failed to fetch {country}, retrying in {2 * (attempt + 1)}s...")
+                    return country, rating if rating != -1.0 else None
                 time.sleep(2 * (attempt + 1))
-            
-            # Treat -1.0 (no players) as None for actual team strength logic
-            results[country] = rating if (rating is not None and rating != -1.0) else None
-            time.sleep(random.uniform(2.0, 3.5))  # robust rate limit delay
+            return country, None
+
+        max_workers = min(6, len(missing_player))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for c in missing_player:
+                futures[executor.submit(fetch_with_retry, c)] = c
+                time.sleep(random.uniform(0.5, 1.0))
+            for future in futures:
+                country, rating = future.result()
+                results[country] = rating
 
     save_player_ratings_cache({k: v for k, v in results.items() if v is not None})
 
@@ -824,17 +830,19 @@ def check_for_updates(countries: List[str]):
     """Background check for rating updates after fixture generation."""
     def background_check():
         logging.info("Checking for rating updates...")
-        # Fresh fetch to detect changes
         new_data = fetch_all_data(countries, use_cache=False)
         return new_data
-    
+
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(background_check)
         try:
-            future.result(timeout=120)
+            future.result(timeout=300)
             logging.info("Rating update check complete.")
+        except TimeoutError:
+            logging.warning("Background check timed out after 300s")
         except Exception as e:
-            logging.warning(f"Background check failed: {e}")
+            import traceback
+            logging.warning(f"Background check failed:\n{traceback.format_exc()}")
 
 
 def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_simulations: int = 2000):
