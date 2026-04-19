@@ -1,0 +1,8 @@
+.aider*
+.env
+__pycache__/
+cache/
+scratch/
+*.log
+*.html
+test*.py

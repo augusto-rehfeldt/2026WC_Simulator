@@ -46,7 +46,7 @@ warnings.filterwarnings('ignore')
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('simulation.log'),
@@ -180,18 +180,17 @@ def fetch_player_ratings_from_fifaratings(country: str, session: requests.Sessio
 
         html = response.text
 
-        # The current page structure puts OVA in the 3rd column, not the 4th.
-        # Extract only player-table rows: OVA cell immediately followed by TOTAL cell.
+        # Extract only player-table rows: OVA cell immediately followed by another attribute box
         matches = re.findall(
             r'<td><span class="[^"]*attribute-box[^"]*">\s*([0-9]+(?:\.[0-9]+)?)\s*</span></td>\s*'
-            r'<td><span class="[^"]*total_attributes[^"]*">',
+            r'<td><span class="[^"]*attribute-box[^"]*">',
             html,
             flags=re.IGNORECASE | re.DOTALL,
         )
         player_ratings = [float(value) for value in matches if float(value) > 0]
 
         if not player_ratings:
-            return None
+            return -1.0  # Indicates successful fetch but legitimately no players
 
         top_players = sorted(player_ratings, reverse=True)[:11]
         return sum(top_players) / len(top_players)
@@ -429,7 +428,7 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
 
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     })
 
     if use_cache and cached_fifa_teams:
@@ -476,8 +475,9 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
                 logging.warning(f"Failed to fetch {country}, retrying in {2 * (attempt + 1)}s...")
                 time.sleep(2 * (attempt + 1))
             
-            results[country] = rating if rating else None
-            time.sleep(1.0)  # rate limit delay
+            # Treat -1.0 (no players) as None for actual team strength logic
+            results[country] = rating if (rating is not None and rating != -1.0) else None
+            time.sleep(random.uniform(2.0, 3.5))  # robust rate limit delay
 
     save_player_ratings_cache({k: v for k, v in results.items() if v is not None})
 
