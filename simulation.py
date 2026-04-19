@@ -382,14 +382,19 @@ def compute_combined_strength(
         return DEFAULT_TEAM_STRENGTH
 
     if player_rating is None:
-        normalized = (fifa_points - FIFA_MIN) / (FIFA_MAX - FIFA_MIN)
-        normalized = max(0, min(1, normalized))
-        return 1200 + normalized * 600
+        # If player ratings couldn't be fetched (e.g. rate limited), don't
+        # inflate the team using purely fifa points. Historically, player_norm
+        # runs lower than fifa_norm (e.g. 0.7 vs 0.95). So we infer a synthetic player norm.
+        fifa_norm = max(0, min(1, (fifa_points - FIFA_MIN) / (FIFA_MAX - FIFA_MIN)))
+        synthetic_player_norm = fifa_norm * 0.75 
+        combined = PLAYER_WEIGHT * synthetic_player_norm + RANKING_WEIGHT * fifa_norm
+        return 1200 + combined * 600
 
     if fifa_points is None:
-        normalized = (player_rating - PLAYER_MIN) / (PLAYER_MAX - PLAYER_MIN)
-        normalized = max(0, min(1, normalized))
-        return 1200 + normalized * 600
+        player_norm = max(0, min(1, (player_rating - PLAYER_MIN) / (PLAYER_MAX - PLAYER_MIN)))
+        synthetic_fifa_norm = min(1.0, player_norm * 1.33)
+        combined = PLAYER_WEIGHT * player_norm + RANKING_WEIGHT * synthetic_fifa_norm
+        return 1200 + combined * 600
 
     player_norm = max(0, min(1, (player_rating - PLAYER_MIN) / (PLAYER_MAX - PLAYER_MIN)))
     fifa_norm = max(0, min(1, (fifa_points - FIFA_MIN) / (FIFA_MAX - FIFA_MIN)))
@@ -463,9 +468,16 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
     else:
         logging.info(f"Fetching player ratings for {len(missing_player)} countries...")
         for country in missing_player:
-            rating = fetch_player_ratings_from_fifaratings(country, session)
+            rating = None
+            for attempt in range(3):
+                rating = fetch_player_ratings_from_fifaratings(country, session)
+                if rating is not None:
+                    break
+                logging.warning(f"Failed to fetch {country}, retrying in {2 * (attempt + 1)}s...")
+                time.sleep(2 * (attempt + 1))
+            
             results[country] = rating if rating else None
-            time.sleep(0.3)
+            time.sleep(1.0)  # rate limit delay
 
     save_player_ratings_cache({k: v for k, v in results.items() if v is not None})
 
