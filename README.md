@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ## Requirements
 
 - Python 3.x
-- numpy, pandas, requests, beautifulsoup4, tabulate, matplotlib, selenium, webdriver-manager
+- numpy, pandas, requests, tabulate, matplotlib
 
 ## Usage
 
@@ -53,18 +53,18 @@ rm cache/*.json
 
 ```
 .
-├── simulation.py      # Main simulation engine
-├── groups.json        # 2026 World Cup group stage configuration
-├── requirements.txt   # Python dependencies
-├── cache/             # Cached FIFA data (player ratings, rankings)
-├── simulation.log     # Simulation output log
+├── simulation.py # Main simulation engine
+├── groups.json # 2026 World Cup group stage configuration
+├── requirements.txt # Python dependencies
+├── cache/ # Cached FIFA data (player ratings, rankings)
+├── simulation.log # Simulation output log
 └── README.md
 ```
 
 ## Tournament Structure
 
-- **48 teams** divided into **16 groups** of 3 teams each
-- **Group Stage**: Each team plays 3 matches; top 2 from each group advance
+- **48 teams** divided into **12 groups** of 4 teams each
+- **Group Stage**: Each team plays 3 matches (round-robin within group); top 2 from each group (24 teams) + 8 best third-place teams advance
 - **Knockout Rounds**: Round of 32 → Round of 16 → Quarterfinals → Semifinals → Final + Third Place
 
 ## Algorithm

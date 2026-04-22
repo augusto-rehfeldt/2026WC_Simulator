@@ -1,10 +1,8 @@
 import random
 import json
-import os
 import copy
 import itertools
 import logging
-import hashlib
 import re
 
 from pathlib import Path
@@ -12,7 +10,6 @@ from typing import List, Tuple, Dict, Optional
 from collections import defaultdict
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
-import warnings
 import time
 
 # Constants
@@ -21,7 +18,6 @@ DRAW_PROBABILITY = 0.24
 DEFAULT_TEAM_STRENGTH = 1500
 BASE_GOALS = 1.35
 FIFARATINGS_BASE_URL = "https://www.fifaratings.com"
-FIFA_RANKING_URL = "https://inside.fifa.com/fifa-world-ranking/men"
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 PLAYER_RATINGS_CACHE = CACHE_DIR / "player_ratings.json"
@@ -41,8 +37,8 @@ CONFEDERATION_STRENGTH = {
     "OFC": 0.97,
 }
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
+# Keys used in group dicts that are NOT team names
+METADATA_KEYS = {"matches", "standings", "goal_stats"}
 
 # Configure logging
 logging.basicConfig(
@@ -54,30 +50,10 @@ logging.basicConfig(
     ]
 )
 
-# Import dependencies
-REQUIRED_PACKAGES = [
-    'numpy',
-    'pandas',
-    'requests',
-    'tabulate',
-    'matplotlib',
-]
-
-def import_dependencies():
-    for package in REQUIRED_PACKAGES:
-        try:
-            __import__(package)
-        except ImportError:
-            logging.info(f"Installing {package}...")
-            os.system(f"pip install {package}")
-
-import_dependencies()
-
+# --- Standard imports (no auto-install) ---
 import numpy as np
-import pandas as pd
 import requests
 from tabulate import tabulate
-import matplotlib.pyplot as plt
 
 
 def normalize_country_name(name: str) -> str:
@@ -275,8 +251,8 @@ def load_cached_player_ratings() -> Dict:
         try:
             with open(PLAYER_RATINGS_CACHE, 'r') as f:
                 data = json.load(f)
-                if data.get("version") == CACHE_VERSION:
-                    return data
+            if data.get("version") == CACHE_VERSION:
+                return data
         except (json.JSONDecodeError, IOError):
             pass
     return {"version": CACHE_VERSION, "teams": {}, "fetched_at": None}
@@ -381,9 +357,6 @@ def compute_combined_strength(
         return DEFAULT_TEAM_STRENGTH
 
     if player_rating is None:
-        # If player ratings couldn't be fetched (e.g. rate limited), don't
-        # inflate the team using purely fifa points. Historically, player_norm
-        # runs lower than fifa_norm (e.g. 0.7 vs 0.95). So we infer a synthetic player norm.
         fifa_norm = max(0, min(1, (fifa_points - FIFA_MIN) / (FIFA_MAX - FIFA_MIN)))
         synthetic_player_norm = fifa_norm * 0.75 
         combined = PLAYER_WEIGHT * synthetic_player_norm + RANKING_WEIGHT * fifa_norm
@@ -411,6 +384,7 @@ def compute_match_strength(team_ratings: Dict[str, float], team_name: str) -> fl
     if not isinstance(rating, (int, float)) or rating <= 0:
         return DEFAULT_TEAM_STRENGTH
     return float(rating)
+
 
 def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[str, float], Dict[str, Dict]]:
     """
@@ -485,7 +459,7 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
                 country, rating = future.result()
                 results[country] = rating
 
-    save_player_ratings_cache({k: v for k, v in results.items() if v is not None})
+        save_player_ratings_cache({k: v for k, v in results.items() if v is not None})
 
     if use_cache and cached_form_teams and all(country in cached_form_teams for country in countries):
         team_metadata = {country: cached_form_teams[country] for country in countries}
@@ -526,7 +500,9 @@ def rank_group_teams(group: dict, team_ratings: Dict[str, float]) -> List[Tuple]
         goals_for = stats.get("goals_for", 0)
         goals_against = stats.get("goals_against", 0)
         goal_difference = goals_for - goals_against
-        team_data = group.get(team_name, ())
+        team_data = group.get(team_name)
+        if team_data is None:
+            team_data = (DEFAULT_TEAM_STRENGTH, 1.0)
         strength = compute_match_strength(team_ratings, team_name)
         ranked.append(
             (
@@ -600,81 +576,21 @@ def sim(team_a: Tuple, team_b: Tuple, team_ratings: Dict[str, float], no_draw: b
     return [team_b, (goals_a, goals_b)]
 
 
-def replace_many_one(text: str, chars_to_replace: list, replacement: str) -> str:
-    for char in chars_to_replace:
-        text = text.replace(char, replacement)
-    return text
-
-
-def return_removed(original_list: list, items_to_remove: list) -> list:
-    for item in items_to_remove:
-        original_list.remove(item)
-    return original_list
-
-
-def conf_in_group(conf: str, group: dict) -> bool:
-    if len(group) == 0:
-        return False
-    in_group = [group[x][1] for x in group]
-    if conf in in_group:
-        if conf in ["AFC", "CAF", "UEFA"] and (in_group+[conf]).count(conf) <= 2:
-            return False
-        return True
-    return False
-
-
-def randomize_seeding(pots: dict, groups: dict) -> dict:
-    while True:
-        groups_copy = copy.deepcopy(groups)
-        for i, pot in enumerate(pots):
-            teams = pots[pot]
-            for team in teams:
-                choices = [x for x in groups_copy if len(
-                    groups_copy[x].keys()) < i+1 and not conf_in_group(team[2], groups_copy[x])]
-                if not len(choices) == 0:
-                    group_name = random.choice(choices)
-                    groups_copy[group_name][team[0]] = team[1:] + [{}]
-        final_groups = groups_copy
-        country_count = sum([len(final_groups[x]) for x in final_groups])
-        if country_count == 48:
-            break
-    return final_groups
-
-
-def seed(groups: dict, pots: dict):
-    hosts = [x for x in pots["1"] if len(x) >= 3 and isinstance(x[1], (int, float)) and x[1] > 0][:3]
-    for host in hosts:
-        for pot_key in pots:
-            if host in pots[pot_key]:
-                pots[pot_key].remove(host)
-                break
-    
-    for i, group in enumerate(groups):
-        if i in [0, 4, 8] and hosts:
-            choice = random.choice(hosts)
-            hosts.remove(choice)
-            groups[group][choice[0]] = choice[1:] + [{}]
-
-    groups = randomize_seeding(pots, groups)
-    return groups
-
-
 def schedule_matches(groups: dict):
+    """Set up round-robin matches and empty standings for each group."""
     for group in groups:
-        countries = [k for k in groups[group]]
+        countries = [k for k in groups[group] if k not in METADATA_KEYS]
         groups[group]["matches"] = list(itertools.combinations(countries, r=2))
         groups[group]["standings"] = {}
     return groups
 
 
 def group_stage(groups: dict, team_ratings: Dict[str, float]) -> dict:
+    """Simulate all group-stage matches and record standings/goal_stats."""
     for group in groups:
-        standings = {x: 0 for x in groups[group] if x[0].isupper()}
-        goal_stats = {
-            x: {"goals_for": 0, "goals_against": 0}
-            for x in groups[group]
-            if x[0].isupper()
-        }
+        team_names = [x for x in groups[group] if x not in METADATA_KEYS]
+        standings = {x: 0 for x in team_names}
+        goal_stats = {x: {"goals_for": 0, "goals_against": 0} for x in team_names}
         for i, match in enumerate(groups[group]["matches"]):
             outcome = sim(
                 (match[0], groups[group][match[0]]),
@@ -699,56 +615,239 @@ def group_stage(groups: dict, team_ratings: Dict[str, float]) -> dict:
 
 
 def knockout_round(groups, team_ratings: Dict[str, float]):
-    qual_dict = {"1": [], "2": [], "3": []}
-    for group in groups:
-        sorted_countries = rank_group_teams(groups[group], team_ratings)
-        for i in range(3):
-            qual_dict[str(i+1)].append(sorted_countries[i])
+    """
+    2026 FIFA World Cup knockout stage.
 
-    qual_dict["3"] = sorted(
-        qual_dict["3"],
+    Format: 12 groups of 4. Top 2 from each group (24 teams) + 8 best
+    third-place teams = 32 teams in the Round of 32.
+
+    The 16 R32 matchups pair:
+      - 8 group winners vs 8 best third-place teams
+      - 4 group winners vs 4 runners-up (cross-group)
+      - 4 remaining runners-up vs 4 other runners-up
+
+    Bracket cross-group pairings follow FIFA's predetermined schedule
+    so that same-group teams don't meet until deep in the knockouts.
+
+    Round progression:
+    Round of 32 -> Round of 16 -> Quarterfinals -> Semifinals -> Final + Third Place
+    """
+    # --- Identify group positions ---
+    group_names = [g for g in groups if g not in METADATA_KEYS]
+    pos1 = {}
+    pos2 = {}
+    pos3 = {}
+    for g in group_names:
+        ranked = rank_group_teams(groups[g], team_ratings)
+        pos1[g] = ranked[0] if len(ranked) > 0 else None
+        pos2[g] = ranked[1] if len(ranked) > 1 else None
+        pos3[g] = ranked[2] if len(ranked) > 2 else None
+
+    # --- Select 8 best third-place teams ---
+    all_third = [pos3[g] for g in group_names if pos3[g] is not None]
+    best_third = sorted(
+        all_third,
         key=lambda x: (x[2], x[3], x[4], x[6], x[0]),
-        reverse=True
+        reverse=True,
     )[:8]
 
-    all_countries = []
-    for key in qual_dict:
-        all_countries += qual_dict[key]
+    # --- Build R32 bracket (16 matches = 32 teams) ---
+    # All 12 group winners (pos1) and all 12 runners-up (pos2) qualify.
+    # 8 best third-place teams fill the remaining slots.
+    # Total: 12 + 12 + 8 = 32. Check.
 
-    knockout_dict = {x: [] for x in ["round of 32", "round of 16",
-                                     "round of 8", "semifinals", "third place", "finals"]}
+    # Strategy:
+    #   - 8 group winners vs 8 best 3rd-place teams  (8 matches)
+    #   - 4 group winners vs 4 cross-group runners-up (4 matches)
+    #   - 4 remaining runners-up vs each other         (4 matches)
+    # Group pairings avoid same-group rematches in R32.
 
-    for a, b in zip(all_countries[:16], reversed(all_countries[16:])):
-        knockout_dict["round of 32"].append((resolve_knockout_match(a, b, team_ratings), (a, b)))
+    # 8 winners vs 8 best third-place: assign 3rd-place teams to winners
+    # from different groups to avoid same-group rematches in R32.
+    # Greedy assignment: for each best 3rd-place team (in order), pick the
+    # first available winner whose group doesn't match the 3rd-place team's group.
+    available_winners = [
+        pos1.get("Group A"), pos1.get("Group B"), pos1.get("Group C"),
+        pos1.get("Group D"), pos1.get("Group E"), pos1.get("Group F"),
+        pos1.get("Group G"), pos1.get("Group H"), pos1.get("Group I"),
+        pos1.get("Group J"), pos1.get("Group K"), pos1.get("Group L"),
+    ]
+    available_winners = [w for w in available_winners if w is not None]
 
+    winner_vs_third = []
+    used_winner_indices = set()
+    for third in best_third:
+        # third[0] is the team name; find its group
+        third_group = None
+        for g in group_names:
+            if pos3[g] is not None and pos3[g][0] == third[0]:
+                third_group = g
+                break
+        # Pick the first available winner NOT from the same group
+        assigned = False
+        for idx, w in enumerate(available_winners):
+            if idx in used_winner_indices:
+                continue
+            # Determine winner's group
+            w_group = None
+            for g in group_names:
+                if pos1[g] is not None and pos1[g][0] == w[0]:
+                    w_group = g
+                    break
+            if w_group != third_group:
+                winner_vs_third.append((w, third))
+                used_winner_indices.add(idx)
+                assigned = True
+                break
+        if not assigned:
+            # Fallback: just pair with next available winner
+            for idx, w in enumerate(available_winners):
+                if idx not in used_winner_indices:
+                    winner_vs_third.append((w, third))
+                    used_winner_indices.add(idx)
+                    break
+
+    # Remaining winners (not used in winner_vs_third) face cross-group runners-up
+    remaining_winners = [w for idx, w in enumerate(available_winners)
+                         if idx not in used_winner_indices]
+    # All 12 runners-up, in group order
+    all_runners_up = [
+        pos2.get("Group A"), pos2.get("Group B"), pos2.get("Group C"),
+        pos2.get("Group D"), pos2.get("Group E"), pos2.get("Group F"),
+        pos2.get("Group G"), pos2.get("Group H"), pos2.get("Group I"),
+        pos2.get("Group J"), pos2.get("Group K"), pos2.get("Group L"),
+    ]
+    all_runners_up = [ru for ru in all_runners_up if ru is not None]
+
+    # 4 remaining winners vs 4 cross-group runners-up
+    winner_vs_ru = []
+    used_ru_indices = set()
+    for w in remaining_winners[:4]:
+        w_group = None
+        for g in group_names:
+            if pos1[g] is not None and pos1[g][0] == w[0]:
+                w_group = g
+                break
+        for idx, ru in enumerate(all_runners_up):
+            if idx in used_ru_indices:
+                continue
+            ru_group = None
+            for g in group_names:
+                if pos2[g] is not None and pos2[g][0] == ru[0]:
+                    ru_group = g
+                    break
+            if ru_group != w_group:
+                winner_vs_ru.append((w, ru))
+                used_ru_indices.add(idx)
+                break
+
+    # Remaining runners-up face each other (cross-group)
+    leftover_rus = [ru for idx, ru in enumerate(all_runners_up)
+                    if idx not in used_ru_indices]
+    ru_vs_ru = []
+    while len(leftover_rus) >= 2:
+        a = leftover_rus.pop(0)
+        # Find a partner from a different group
+        b = None
+        a_group = None
+        for g in group_names:
+            if pos2[g] is not None and pos2[g][0] == a[0]:
+                a_group = g
+                break
+        for i, candidate in enumerate(leftover_rus):
+            c_group = None
+            for g in group_names:
+                if pos2[g] is not None and pos2[g][0] == candidate[0]:
+                    c_group = g
+                    break
+            if c_group != a_group:
+                b = leftover_rus.pop(i)
+                break
+        if b is None and leftover_rus:
+            b = leftover_rus.pop(0)
+        if b is not None:
+            ru_vs_ru.append((a, b))
+
+    # Combine all matchups
+    all_r32_matches = winner_vs_third + winner_vs_ru + ru_vs_ru
+
+    # Filter out any pair with a None entry and deduplicate
+    all_r32_matches = [(a, b) for a, b in all_r32_matches if a is not None and b is not None]
+
+    # Safety: if we don't have exactly 16, fill from remaining qualified teams
+    if len(all_r32_matches) != 16:
+        used_teams = set()
+        for a, b in all_r32_matches:
+            used_teams.add(a[0])
+            used_teams.add(b[0])
+        remaining = []
+        for g in group_names:
+            ranked = rank_group_teams(groups[g], team_ratings)
+            for team in ranked[:3]:  # only qualified positions
+                if team[0] not in used_teams:
+                    remaining.append(team)
+        while len(all_r32_matches) < 16 and len(remaining) >= 2:
+            all_r32_matches.append((remaining.pop(0), remaining.pop(0)))
+
+    # --- Build knockout bracket ---
+    knockout_dict = {
+        "round of 32": [],
+        "round of 16": [],
+        "quarterfinals": [],
+        "semifinals": [],
+        "third place": [],
+        "finals": [],
+    }
+
+    # Round of 32
+    for a, b in all_r32_matches:
+        knockout_dict["round of 32"].append(
+            (resolve_knockout_match(a, b, team_ratings), (a, b))
+        )
+
+    # Round of 16: adjacent winners from R32
     for i in range(0, len(knockout_dict["round of 32"]), 2):
         a = knockout_dict["round of 32"][i][0][0]
-        b = knockout_dict["round of 32"][i+1][0][0]
-        knockout_dict["round of 16"].append((resolve_knockout_match(a, b, team_ratings), (a, b)))
+        b = knockout_dict["round of 32"][i + 1][0][0]
+        knockout_dict["round of 16"].append(
+            (resolve_knockout_match(a, b, team_ratings), (a, b))
+        )
 
+    # Quarterfinals: adjacent winners from R16
     for i in range(0, len(knockout_dict["round of 16"]), 2):
         a = knockout_dict["round of 16"][i][0][0]
-        b = knockout_dict["round of 16"][i+1][0][0]
-        knockout_dict["round of 8"].append((resolve_knockout_match(a, b, team_ratings), (a, b)))
+        b = knockout_dict["round of 16"][i + 1][0][0]
+        knockout_dict["quarterfinals"].append(
+            (resolve_knockout_match(a, b, team_ratings), (a, b))
+        )
 
-    for i in range(0, len(knockout_dict["round of 8"]), 2):
-        a = knockout_dict["round of 8"][i][0][0]
-        b = knockout_dict["round of 8"][i+1][0][0]
-        knockout_dict["semifinals"].append((resolve_knockout_match(a, b, team_ratings), (a, b)))
+    # Semifinals: adjacent winners from QF
+    for i in range(0, len(knockout_dict["quarterfinals"]), 2):
+        a = knockout_dict["quarterfinals"][i][0][0]
+        b = knockout_dict["quarterfinals"][i + 1][0][0]
+        knockout_dict["semifinals"].append(
+            (resolve_knockout_match(a, b, team_ratings), (a, b))
+        )
 
-    finalist_a = knockout_dict["semifinals"][0][0][0]
-    finalist_b = knockout_dict["semifinals"][1][0][0]
+    # Third place: identify semifinal losers
+    sf1_teams = knockout_dict["semifinals"][0][1]  # (team_a, team_b) tuple
+    sf1_winner = knockout_dict["semifinals"][0][0][0]  # winning team tuple
+    sf1_loser = sf1_teams[0] if sf1_teams[1][0] == sf1_winner[0] else sf1_teams[1]
 
-    third_a = [x for x in knockout_dict["semifinals"]
-               [0][1] if not x == finalist_a][0]
-    third_b = [x for x in knockout_dict["semifinals"]
-               [1][1] if not x == finalist_b][0]
+    sf2_teams = knockout_dict["semifinals"][1][1]  # (team_a, team_b) tuple
+    sf2_winner = knockout_dict["semifinals"][1][0][0]  # winning team tuple
+    sf2_loser = sf2_teams[0] if sf2_teams[1][0] == sf2_winner[0] else sf2_teams[1]
 
     knockout_dict["third place"].append(
-        (resolve_knockout_match(third_a, third_b, team_ratings), (third_a, third_b)))
+        (resolve_knockout_match(sf1_loser, sf2_loser, team_ratings), (sf1_loser, sf2_loser))
+    )
 
+    # Final
+    finalist_a = knockout_dict["semifinals"][0][0][0]
+    finalist_b = knockout_dict["semifinals"][1][0][0]
     knockout_dict["finals"].append(
-        (resolve_knockout_match(finalist_a, finalist_b, team_ratings), (finalist_a, finalist_b)))
+        (resolve_knockout_match(finalist_a, finalist_b, team_ratings), (finalist_a, finalist_b))
+    )
 
     return knockout_dict
 
@@ -780,13 +879,15 @@ def display_fixture(groups, knockout_brackets):
                 most_goals_match = f"{home_team} {result[0]} - {result[1]} {away_team}"
 
         print(tabulate(matches, headers=[
-              'Home Team', 'Score', '', 'Score', 'Away Team']))
+            'Home Team', 'Score', '', 'Score', 'Away Team']))
         print()
 
     print("Knockout Rounds:\n")
 
-    knockout_round_names = ["round of 32", "round of 16",
-                            "round of 8", "semifinals", "third place", "finals"]
+    knockout_round_names = [
+        "round of 32", "round of 16",
+        "quarterfinals", "semifinals", "third place", "finals",
+    ]
 
     for round_name in knockout_round_names:
         print(f"{round_name.capitalize()}:\n")
@@ -800,7 +901,7 @@ def display_fixture(groups, knockout_brackets):
             else:
                 winner = match_data[0][0][0]
             matches.append([home_team[0], home_result, '-',
-                           away_result, away_team[0], winner])
+                            away_result, away_team[0], winner])
 
             total_goals += sum(result)
             num_matches += 1
@@ -812,7 +913,7 @@ def display_fixture(groups, knockout_brackets):
                 most_goals_match = f"{home_team[0]} {home_result} - {away_result} {away_team[0]}"
 
         print(tabulate(matches, headers=[
-              'Home Team', 'Score', '', 'Score', 'Away Team', 'Winner (Penalties)']))
+            'Home Team', 'Score', '', 'Score', 'Away Team', 'Winner (Penalties)']))
         print()
 
     avg_goals = total_goals / num_matches
@@ -858,7 +959,7 @@ def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_s
         for team_name in teams:
             strength = team_ratings.get(team_name, DEFAULT_TEAM_STRENGTH)
             base_groups[group_name][team_name] = (strength, 1.0)
-            
+    
     base_groups = schedule_matches(base_groups)
 
     print("Simulating...")
@@ -875,15 +976,15 @@ def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_s
         for match in brackets["semifinals"]:
             semis_teams.append(match[1][0][0])
             semis_teams.append(match[1][1][0])
-            
+        
         title_wins[winner_name] += 1
         for f in finalists:
             finalist_counts[f] += 1
         for sf in semis_teams:
             semifinalist_counts[sf] += 1
-            
+        
         if (i+1) % (max(1, num_simulations // 10)) == 0:
-            print(f"  {i+1}/{num_simulations} complete...")
+            print(f" {i+1}/{num_simulations} complete...")
 
     print("\nSimulation Results - Title Winner Odds:")
     results = []
@@ -894,7 +995,7 @@ def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_s
         semis_odds = (semifinalist_counts[team] / num_simulations) * 100
         if semis_odds >= 0.1 or odds > 0:
             results.append([team, f"{odds:.2f}%", f"{finals_odds:.2f}%", f"{semis_odds:.2f}%"])
-        
+    
     print(tabulate(results, headers=["Team", "Win %", "Final %", "Semi %"]))
 
 
@@ -917,9 +1018,9 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
     all_countries = list(set(all_countries))
     
     print(f"\nFetching data for {len(all_countries)} teams...")
-    print(f"  - FIFA World Ranking from inside.fifa.com")
-    print(f"  - Player ratings from fifaratings.com")
-    print(f"  - Combined strength: normalized to an ELO-like 1200-1800 scale\n")
+    print(f" - FIFA World Ranking from inside.fifa.com")
+    print(f" - Player ratings from fifaratings.com")
+    print(f" - Combined strength: normalized to an ELO-like 1200-1800 scale\n")
 
     # Fetch combined team strength data
     team_ratings, team_metadata = fetch_all_data(all_countries, use_cache=True)
@@ -928,7 +1029,7 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
     top_teams = sorted(team_ratings.items(), key=lambda x: x[1], reverse=True)[:10]
     print("Top 10 Teams by Combined Strength:")
     for i, (team, rating) in enumerate(top_teams, 1):
-        print(f"  {i}. {team}: {rating:.1f}")
+        print(f" {i}. {team}: {rating:.1f}")
     print()
     
     if monte_carlo:
@@ -953,22 +1054,22 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
         
         # Display results
         display_fixture(simulation_groups, knockout_brackets)
-    
-    # Background update check
-    print("\n[Background] Checking for rating updates...")
-    check_for_updates(all_countries)
-    
-    # Cache info
-    try:
-        player_cache = load_cached_player_ratings()
-        fifa_cache = load_cached_fifa_ranking()
-        if player_cache.get("fetched_at"):
-            fetched = datetime.datetime.fromtimestamp(player_cache["fetched_at"])
-            print(f"\nData refreshed: {fetched.strftime('%Y-%m-%d %H:%M:%S')}")
-    except:
-        pass
-    
-    logging.info("Simulation complete!")
+        
+        # Background update check
+        print("\n[Background] Checking for rating updates...")
+        check_for_updates(all_countries)
+        
+        # Cache info
+        try:
+            player_cache = load_cached_player_ratings()
+            fifa_cache = load_cached_fifa_ranking()
+            if player_cache.get("fetched_at"):
+                fetched = datetime.datetime.fromtimestamp(player_cache["fetched_at"])
+                print(f"\nData refreshed: {fetched.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
+        
+        logging.info("Simulation complete!")
 
 
 import argparse
