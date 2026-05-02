@@ -39,6 +39,11 @@ CONFEDERATION_STRENGTH = {
 
 # Keys used in group dicts that are NOT team names
 METADATA_KEYS = {"matches", "standings", "goal_stats"}
+GROUP_MATCHDAY_PAIRINGS = [
+    (0, 1), (2, 3),
+    (0, 2), (3, 1),
+    (0, 3), (1, 2),
+]
 
 # Configure logging
 logging.basicConfig(
@@ -577,40 +582,135 @@ def sim(team_a: Tuple, team_b: Tuple, team_ratings: Dict[str, float], no_draw: b
 
 
 def schedule_matches(groups: dict):
-    """Set up round-robin matches and empty standings for each group."""
+    """Set up round-robin matches in a deterministic matchday timeline."""
     for group in groups:
         countries = [k for k in groups[group] if k not in METADATA_KEYS]
-        groups[group]["matches"] = list(itertools.combinations(countries, r=2))
+        if len(countries) == 4:
+            groups[group]["matches"] = [
+                (countries[home_idx], countries[away_idx])
+                for home_idx, away_idx in GROUP_MATCHDAY_PAIRINGS
+            ]
+        else:
+            groups[group]["matches"] = list(itertools.combinations(countries, r=2))
         groups[group]["standings"] = {}
     return groups
 
 
-def group_stage(groups: dict, team_ratings: Dict[str, float]) -> dict:
-    """Simulate all group-stage matches and record standings/goal_stats."""
+def get_group_timeline(groups: dict) -> List[Tuple[str, int]]:
+    """Return group/match indexes in tournament-wide group-stage order."""
+    timeline = []
+    group_names = [g for g in groups if g not in METADATA_KEYS]
+    max_matches = max((len(groups[g].get("matches", [])) for g in group_names), default=0)
+    for match_idx in range(max_matches):
+        for group in group_names:
+            if match_idx < len(groups[group].get("matches", [])):
+                timeline.append((group, match_idx))
+    return timeline
+
+
+def normalize_match_key(team_a: str, team_b: str) -> Tuple[str, str]:
+    return tuple(sorted((team_a, team_b)))
+
+
+def load_current_state(path: Optional[str], official_groups: dict) -> Dict[Tuple[str, str], Dict[str, int]]:
+    """Load played group-stage results from a JSON file."""
+    if not path:
+        return {}
+
+    with open(path, "r") as f:
+        state = json.load(f)
+
+    matches = state.get("matches", state) if isinstance(state, dict) else state
+    if not isinstance(matches, list):
+        raise ValueError("Current state must be a JSON list or an object with a 'matches' list.")
+
+    known_teams = {team for teams in official_groups.values() for team in teams}
+    scheduled_pairs = set()
+    for teams in official_groups.values():
+        if len(teams) == 4:
+            group_matches = [(teams[a], teams[b]) for a, b in GROUP_MATCHDAY_PAIRINGS]
+        else:
+            group_matches = list(itertools.combinations(teams, r=2))
+        for home_team, away_team in group_matches:
+            scheduled_pairs.add(normalize_match_key(home_team, away_team))
+
+    results = {}
+    for idx, match in enumerate(matches, 1):
+        if not isinstance(match, dict):
+            raise ValueError(f"Current state match #{idx} must be an object.")
+        home_team = match.get("home") or match.get("home_team")
+        away_team = match.get("away") or match.get("away_team")
+        if home_team not in known_teams or away_team not in known_teams:
+            raise ValueError(f"Current state match #{idx} contains an unknown team.")
+
+        if "score" in match:
+            score = match["score"]
+            if not isinstance(score, list) or len(score) != 2:
+                raise ValueError(f"Current state match #{idx} score must be [home_goals, away_goals].")
+            home_goals, away_goals = score
+        else:
+            home_goals = match.get("home_score")
+            away_goals = match.get("away_score")
+
+        if not isinstance(home_goals, int) or not isinstance(away_goals, int) or home_goals < 0 or away_goals < 0:
+            raise ValueError(f"Current state match #{idx} must have non-negative integer scores.")
+
+        key = normalize_match_key(home_team, away_team)
+        if key not in scheduled_pairs:
+            raise ValueError(f"Current state match #{idx} is not a scheduled group-stage match.")
+        if key in results:
+            raise ValueError(f"Current state has a duplicate result for {home_team} vs {away_team}.")
+
+        results[key] = {home_team: home_goals, away_team: away_goals}
+
+    return results
+
+
+def group_stage(
+    groups: dict,
+    team_ratings: Dict[str, float],
+    current_results: Optional[Dict[Tuple[str, str], Dict[str, int]]] = None,
+) -> dict:
+    """Simulate remaining group-stage matches and record standings/goal_stats."""
+    current_results = current_results or {}
     for group in groups:
         team_names = [x for x in groups[group] if x not in METADATA_KEYS]
-        standings = {x: 0 for x in team_names}
-        goal_stats = {x: {"goals_for": 0, "goals_against": 0} for x in team_names}
-        for i, match in enumerate(groups[group]["matches"]):
-            outcome = sim(
-                (match[0], groups[group][match[0]]),
-                (match[1], groups[group][match[1]]),
-                team_ratings
-            )
-            groups[group]["matches"][i] = groups[group]["matches"][i] + ((outcome[1],))
-            home_team, away_team = match[0], match[1]
-            home_goals, away_goals = outcome[1]
-            goal_stats[home_team]["goals_for"] += home_goals
-            goal_stats[home_team]["goals_against"] += away_goals
-            goal_stats[away_team]["goals_for"] += away_goals
-            goal_stats[away_team]["goals_against"] += home_goals
-            if isinstance(outcome[0][0], str):
-                standings[outcome[0][0]] += 3
+        groups[group]["standings"] = {x: 0 for x in team_names}
+        groups[group]["goal_stats"] = {x: {"goals_for": 0, "goals_against": 0} for x in team_names}
+
+    for group, i in get_group_timeline(groups):
+        match = groups[group]["matches"][i]
+        if len(match) == 3:
+            home_team, away_team, result = match
+        else:
+            home_team, away_team = match
+            imported_result = current_results.get(normalize_match_key(home_team, away_team))
+            if imported_result is not None:
+                result = (imported_result[home_team], imported_result[away_team])
             else:
-                for country in outcome[0]:
-                    standings[country[0]] += 1
-        groups[group]["standings"] = standings
-        groups[group]["goal_stats"] = goal_stats
+                outcome = sim(
+                    (home_team, groups[group][home_team]),
+                    (away_team, groups[group][away_team]),
+                    team_ratings
+                )
+                result = outcome[1]
+            groups[group]["matches"][i] = (home_team, away_team, result)
+
+        standings = groups[group]["standings"]
+        goal_stats = groups[group]["goal_stats"]
+        home_goals, away_goals = result
+        goal_stats[home_team]["goals_for"] += home_goals
+        goal_stats[home_team]["goals_against"] += away_goals
+        goal_stats[away_team]["goals_for"] += away_goals
+        goal_stats[away_team]["goals_against"] += home_goals
+
+        if home_goals > away_goals:
+            standings[home_team] += 3
+        elif away_goals > home_goals:
+            standings[away_team] += 3
+        else:
+            standings[home_team] += 1
+            standings[away_team] += 1
     return groups
 
 
@@ -946,7 +1046,12 @@ def check_for_updates(countries: List[str]):
             logging.warning(f"Background check failed:\n{traceback.format_exc()}")
 
 
-def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_simulations: int = 2000):
+def run_monte_carlo(
+    official_groups: dict,
+    team_ratings: Dict[str, float],
+    num_simulations: int = 2000,
+    current_results: Optional[Dict[Tuple[str, str], Dict[str, int]]] = None,
+):
     print(f"\nRunning Monte Carlo Simulation ({num_simulations} iterations)...")
     title_wins = defaultdict(int)
     finalist_counts = defaultdict(int)
@@ -965,7 +1070,7 @@ def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_s
     print("Simulating...")
     for i in range(num_simulations):
         sim_groups = copy.deepcopy(base_groups)
-        sim_groups = group_stage(sim_groups, team_ratings)
+        sim_groups = group_stage(sim_groups, team_ratings, current_results=current_results)
         brackets = knockout_round(sim_groups, team_ratings)
         
         finals_match = brackets["finals"][0]
@@ -999,7 +1104,11 @@ def run_monte_carlo(official_groups: dict, team_ratings: Dict[str, float], num_s
     print(tabulate(results, headers=["Team", "Win %", "Final %", "Semi %"]))
 
 
-def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
+def run_simulation(
+    monte_carlo: bool = False,
+    num_simulations: int = 2000,
+    current_state_path: Optional[str] = None,
+):
     """Main simulation runner with combined FIFA ratings."""
     import datetime
     
@@ -1015,7 +1124,11 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
     all_countries = []
     for teams in official_groups.values():
         all_countries.extend(teams)
-    all_countries = list(set(all_countries))
+    all_countries = sorted(set(all_countries))
+
+    current_results = load_current_state(current_state_path, official_groups)
+    if current_results:
+        print(f"\nLoaded {len(current_results)} played group-stage matches from {current_state_path}")
     
     print(f"\nFetching data for {len(all_countries)} teams...")
     print(f" - FIFA World Ranking from inside.fifa.com")
@@ -1033,7 +1146,12 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
     print()
     
     if monte_carlo:
-        run_monte_carlo(official_groups, team_ratings, num_simulations)
+        run_monte_carlo(
+            official_groups,
+            team_ratings,
+            num_simulations,
+            current_results=current_results,
+        )
     else:
         # Prepare simulation groups
         simulation_groups = {}
@@ -1047,7 +1165,11 @@ def run_simulation(monte_carlo: bool = False, num_simulations: int = 2000):
         simulation_groups = schedule_matches(simulation_groups)
         
         print("Simulating Group Stage...")
-        simulation_groups = group_stage(simulation_groups, team_ratings)
+        simulation_groups = group_stage(
+            simulation_groups,
+            team_ratings,
+            current_results=current_results,
+        )
         
         print("Simulating Knockout Rounds...")
         knockout_brackets = knockout_round(simulation_groups, team_ratings)
@@ -1078,6 +1200,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="World Cup Simulator")
     parser.add_argument("--mc", action="store_true", help="Run Monte Carlo simulation")
     parser.add_argument("--runs", type=int, default=2000, help="Number of Monte Carlo simulations")
+    parser.add_argument(
+        "--current-state",
+        help="JSON file containing already played group-stage matches to import before simulating the rest",
+    )
     args = parser.parse_args()
     
-    run_simulation(monte_carlo=args.mc, num_simulations=args.runs)
+    run_simulation(
+        monte_carlo=args.mc,
+        num_simulations=args.runs,
+        current_state_path=args.current_state,
+    )

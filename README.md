@@ -36,6 +36,27 @@ python simulation.py
 python simulation.py --mc --runs 5000
 ```
 
+### Resume From Current State
+Import already played group-stage matches, then simulate the remaining group matches in tournament timeline order before continuing to knockouts:
+
+```bash
+python simulation.py --current-state current_state.json
+python simulation.py --mc --runs 5000 --current-state current_state.json
+```
+
+`current_state.json` can be either a list of matches or an object with a `matches` list:
+
+```json
+{
+  "matches": [
+    {"home": "Mexico", "away": "South Africa", "score": [2, 1]},
+    {"home": "South Korea", "away": "Czech Republic", "home_score": 1, "away_score": 1}
+  ]
+}
+```
+
+The imported matches must be scheduled group-stage fixtures from `groups.json`. Missing matches are simulated; imported scores are kept fixed.
+
 ### Output
 The simulator displays:
 - Group stage results with match scores
@@ -66,6 +87,7 @@ rm cache/*.json
 - **48 teams** divided into **12 groups** of 4 teams each
 - **Group Stage**: Each team plays 3 matches (round-robin within group); top 2 from each group (24 teams) + 8 best third-place teams advance
 - **Knockout Rounds**: Round of 32 → Round of 16 → Quarterfinals → Semifinals → Final + Third Place
+- **Resume Support**: Played group-stage matches can be imported so the simulator continues from the current table state
 
 ## Algorithm
 
