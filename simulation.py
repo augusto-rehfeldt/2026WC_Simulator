@@ -61,35 +61,36 @@ import requests
 from tabulate import tabulate
 
 
+# ponytail: single source of truth for country aliases; per-context keys pick the variant
+ALIASES = {
+    "United States":            {"fifa": "USA", "match": ["United States", "USA", "United States of America"]},
+    "South Korea":              {"url": "South-Korea", "fifa": "Korea Republic", "match": ["South Korea", "Korea Republic", "Korea"]},
+    "Ivory Coast":              {"url": "Ivory-Coast", "fifa": "Côte d'Ivoire", "match": ["Ivory Coast", "Côte d'Ivoire"]},
+    "Bosnia and Herzegovina":   {"url": "Bosnia", "match": ["Bosnia", "Bosnia and Herzegovina"]},
+    "DR Congo":                 {"url": "DR-Congo", "fifa": "Congo DR", "match": ["DR Congo", "Congo DR"]},
+    "Czech Republic":           {"fifa": "Czechia", "match": ["Czech Republic", "Czechia"]},
+    "Cape Verde":               {"url": "Cape-Verde", "fifa": "Cape Verde Islands", "match": ["Cape Verde", "Cape Verde Islands"]},
+    "Turkey":                   {"fifa": "Türkiye", "match": ["Turkey", "Türkiye"]},
+    "Curaçao":                  {"url": "Curacao", "match": ["Curaçao", "Curacao"]},
+    "New Zealand":              {"url": "New-Zealand"},
+    "Saudi Arabia":             {"url": "Saudi-Arabia"},
+}
+
+
 def normalize_country_name(name: str) -> str:
     """Normalize country name for fifaratings.com URL generation."""
-    mappings = {
-        "Curaçao": "Curacao",
-        "Ivory Coast": "Ivory-Coast",
-        "South Korea": "South-Korea",
-        "Bosnia and Herzegovina": "Bosnia",
-        "DR Congo": "DR-Congo",
-        "New Zealand": "New-Zealand",
-        "Saudi Arabia": "Saudi-Arabia",
-        "Cape Verde": "Cape-Verde",
-    }
-    return mappings.get(name, name.replace(" ", "-"))
+    entry = ALIASES.get(name)
+    if entry and "url" in entry:
+        return entry["url"]
+    return name.replace(" ", "-")
 
 
 def normalize_country_for_fifa(name: str) -> str:
     """Normalize country name for FIFA ranking lookup."""
-    mappings = {
-        "United States": "USA",
-        "South Korea": "Korea Republic",
-        "Ivory Coast": "Côte d'Ivoire",
-        "Bosnia and Herzegovina": "Bosnia and Herzegovina",
-        "DR Congo": "Congo DR",
-        "Cape Verde": "Cape Verde Islands",
-        "Czech Republic": "Czechia",
-        "Turkey": "Türkiye",
-        "Curaçao": "Curaçao",
-    }
-    return mappings.get(name, name)
+    entry = ALIASES.get(name)
+    if entry and "fifa" in entry:
+        return entry["fifa"]
+    return name
 
 
 def compute_confederation_factor(confederation: Optional[str]) -> float:
@@ -180,6 +181,18 @@ def fetch_player_ratings_from_fifaratings(country: str, session: requests.Sessio
         return None
 
 
+def _parse_fifa_ranking_rows(rows: List[Dict]) -> Dict[str, float]:
+    """Extract {country: points} from FIFA ranking API result rows."""
+    ranking = {}
+    for row in rows:
+        team_name_entries = row.get("TeamName") or []
+        team_name = team_name_entries[0].get("Description") if team_name_entries else None
+        points = row.get("DecimalTotalPoints") or row.get("TotalPoints")
+        if team_name and isinstance(points, (int, float)) and points > 0:
+            ranking[team_name] = float(points)
+    return ranking
+
+
 def fetch_fifa_world_ranking(session: requests.Session) -> Dict[str, float]:
     """
     Fetch FIFA World Ranking points from FIFA's JSON API.
@@ -192,18 +205,7 @@ def fetch_fifa_world_ranking(session: requests.Session) -> Dict[str, float]:
             logging.warning(f"Failed to fetch FIFA ranking: HTTP {response.status_code}")
             return {}
 
-        payload = response.json()
-        ranking_data = {}
-
-        for row in payload.get("Results", []):
-            team_name_entries = row.get("TeamName") or []
-            team_name = None
-            if team_name_entries:
-                team_name = team_name_entries[0].get("Description")
-            points = row.get("DecimalTotalPoints") or row.get("TotalPoints")
-            if team_name and isinstance(points, (int, float)) and points > 0:
-                ranking_data[team_name] = float(points)
-
+        ranking_data = _parse_fifa_ranking_rows(response.json().get("Results", []))
         logging.info(f"Fetched FIFA ranking for {len(ranking_data)} teams")
         return ranking_data
 
@@ -229,25 +231,14 @@ def match_fifa_ranking_country(country: str, fifa_data: Dict[str, float]) -> Opt
         if country_lower in fifa_country.lower() or fifa_country.lower() in country_lower:
             return points
     
-    # Special cases
-    special_mappings = {
-        "United States": ["United States", "USA", "United States of America"],
-        "South Korea": ["South Korea", "Korea Republic", "Korea"],
-        "Bosnia and Herzegovina": ["Bosnia", "Bosnia and Herzegovina"],
-        "Ivory Coast": ["Ivory Coast", "Côte d'Ivoire"],
-        "DR Congo": ["DR Congo", "Congo DR"],
-        "Czech Republic": ["Czech Republic", "Czechia"],
-        "Cape Verde": ["Cape Verde", "Cape Verde Islands"],
-        "Turkey": ["Turkey", "Türkiye"],
-        "Curaçao": ["Curaçao", "Curacao"],
-    }
-    
-    for key, variants in special_mappings.items():
-        if country in variants:
+    # Special cases: try every known variant of each aliased country
+    for canonical, entry in ALIASES.items():
+        variants = entry.get("match")
+        if variants and country in variants:
             for variant in variants:
                 if variant in fifa_data:
                     return fifa_data[variant]
-    
+
     return None
 
 
@@ -420,13 +411,7 @@ def fetch_all_data(countries: List[str], use_cache: bool = True) -> Tuple[Dict[s
         response = session.get(api_url, timeout=30)
         payload = response.json() if response.status_code == 200 else {}
         fifa_ranking_rows = payload.get("Results", [])
-        fifa_ranking = {}
-        for row in fifa_ranking_rows:
-            team_name_entries = row.get("TeamName") or []
-            team_name = team_name_entries[0].get("Description") if team_name_entries else None
-            points = row.get("DecimalTotalPoints") or row.get("TotalPoints")
-            if team_name and isinstance(points, (int, float)) and points > 0:
-                fifa_ranking[team_name] = float(points)
+        fifa_ranking = _parse_fifa_ranking_rows(fifa_ranking_rows)
         if fifa_ranking:
             save_fifa_ranking_cache(fifa_ranking, fifa_ranking_rows)
         else:
@@ -1027,25 +1012,6 @@ def display_fixture(groups, knockout_brackets):
     print(f"Team(s) with least goals: {', '.join(least_goals_team)} ({min(team_goals.values())} goals)")
 
 
-def check_for_updates(countries: List[str]):
-    """Background check for rating updates after fixture generation."""
-    def background_check():
-        logging.info("Checking for rating updates...")
-        new_data = fetch_all_data(countries, use_cache=False)
-        return new_data
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(background_check)
-        try:
-            future.result(timeout=300)
-            logging.info("Rating update check complete.")
-        except TimeoutError:
-            logging.warning("Background check timed out after 300s")
-        except Exception as e:
-            import traceback
-            logging.warning(f"Background check failed:\n{traceback.format_exc()}")
-
-
 def run_monte_carlo(
     official_groups: dict,
     team_ratings: Dict[str, float],
@@ -1176,11 +1142,7 @@ def run_simulation(
         
         # Display results
         display_fixture(simulation_groups, knockout_brackets)
-        
-        # Background update check
-        print("\n[Background] Checking for rating updates...")
-        check_for_updates(all_countries)
-        
+
         # Cache info
         try:
             player_cache = load_cached_player_ratings()
@@ -1194,6 +1156,27 @@ def run_simulation(
         logging.info("Simulation complete!")
 
 
+# ponytail: one runnable check for the alias-merge + parse-helper refactor; run with --self-check
+def _self_check() -> None:
+    assert normalize_country_name("Curaçao") == "Curacao"
+    assert normalize_country_name("South Korea") == "South-Korea"
+    assert normalize_country_name("Brazil") == "Brazil"
+    assert normalize_country_for_fifa("United States") == "USA"
+    assert normalize_country_for_fifa("Czech Republic") == "Czechia"
+    assert normalize_country_for_fifa("Brazil") == "Brazil"
+    assert match_fifa_ranking_country("United States", {"USA": 1660.0}) == 1660.0
+    assert match_fifa_ranking_country("Cape Verde", {"Cape Verde Islands": 1234.0}) == 1234.0
+    rows = [
+        {"TeamName": [{"Description": "Brazil"}], "DecimalTotalPoints": 1840.0},
+        {"TeamName": [{"Description": "Argentina"}], "TotalPoints": 1880.0},
+        {"TeamName": [], "DecimalTotalPoints": 1000.0},
+        {"TeamName": [{"Description": "X"}], "DecimalTotalPoints": 0},
+    ]
+    parsed = _parse_fifa_ranking_rows(rows)
+    assert parsed == {"Brazil": 1840.0, "Argentina": 1880.0}, parsed
+    print("ponytail self-check OK")
+
+
 import argparse
 
 if __name__ == "__main__":
@@ -1204,8 +1187,13 @@ if __name__ == "__main__":
         "--current-state",
         help="JSON file containing already played group-stage matches to import before simulating the rest",
     )
+    parser.add_argument("--self-check", action="store_true", help="Run built-in refactor self-check and exit")
     args = parser.parse_args()
-    
+
+    if args.self_check:
+        _self_check()
+        raise SystemExit(0)
+
     run_simulation(
         monte_carlo=args.mc,
         num_simulations=args.runs,
